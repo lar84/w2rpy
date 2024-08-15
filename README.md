@@ -4,6 +4,8 @@
 
 **Install code from [PyPI](https://pypi.org/project/w2rpy)**
 
+## Documentation
+
 **terrain(dem_file)**
 - Returns Terrain object. Terrain object contains the following objects:
  	- DEM, flow accumulation, flow direction, pysheds Grid, and coordinate system
