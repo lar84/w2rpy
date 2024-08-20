@@ -1358,5 +1358,87 @@ def pebble_count(photo_file, obj_color='yellow', obj_size_mm=190.5, min_area=50)
     fig.savefig(photo_file.replace('.jpg', '_grain_labels.png'), dpi=400)
     
     print('{0} pebbles counted for {1}'.format(len(grain_data), photo_file))
-        
-    
+
+def delineate_trees(ch_file, output, canopy_floor=15, min_ht=50, max_ht=100, min_area=20, combine_dist=5):
+    """
+    Identify trees from a canopy height model (CHM) raster file and export the results to a shapefile.
+
+    Parameters:
+    ch_file : str
+        Path to the canopy height model raster file.
+    output : str
+        Path to save the resulting tree locations shapefile.
+    canopy_floor : int
+        Height threshold to consider the ground level of the canopy (default 15).
+    min_ht : int
+        Minimum height to consider a detection as a tree (default 50).
+    max_ht : int
+        Maximum height to still consider the detection as a tree (default 100).
+    min_area : int
+        Minimum area for a tree detection to be considered valid (default 20).
+    combine_dist : int
+        Distance within which to combine tree points (default 5).
+
+    Returns:
+    None
+    """
+
+    with rio.open(ch_file) as src:
+        ch = src.read(1)
+        profile = src.profile.copy()
+        nodata = profile['nodata']
+        # Invert the CHM to facilitate pit detection as tree tops
+        a = np.where(ch != nodata, ch * -1, np.nan)
+        # Apply a Gaussian filter to smooth the CHM
+        a = gaussian_filter(a, sigma=1)
+        # Filter out areas below the canopy floor threshold
+        a = np.where(a > -canopy_floor, np.nan, a)
+
+    # Initialize the Grid and Raster objects
+    chi_r = Raster(a)
+    grid = Grid.from_raster(chi_r)
+    fdir = grid.flowdir(chi_r)
+
+    # Detect pits in the inverted CHM, which correspond to tree tops
+    pits = grid.detect_pits(chi_r)
+    idx = np.argwhere(pits)
+
+    # Filter pits based on tree height thresholds
+    pit_ht = ch[pits]
+    tree_bool = (pit_ht > min_ht) & (pit_ht < max_ht)
+    idx = idx[tree_bool]
+
+    # Generate a GeoDataFrame of tree points
+    points = gpd.GeoDataFrame([], geometry=[Point(rc[1], rc[0]) for rc in idx], crs=profile['crs'])
+    points['Z'] = points.geometry.apply(lambda p: ch[int(p.y), int(p.x)])
+    points['TID'] = points.index + 1
+
+    # Function to filter and combine nearby points
+    def filter_points(gdf, dist=combine_dist):
+        for i, row in gdf.iterrows():
+            buffer = row.geometry.buffer(dist)
+            neighbors = gdf[gdf.geometry.intersects(buffer) & (gdf.index != i)]
+            for j, neighbor in neighbors.iterrows():
+                if neighbor['Z'] > row['Z']:
+                    gdf.at[i, 'TID'] = neighbor['TID']
+                    break
+        return gdf
+
+    points = filter_points(points)
+
+    # Create the tree canopy areas
+    trees = np.zeros(ch.shape, dtype=np.int32)
+    for i, row in points.iterrows():
+        catch = grid.catchment(x=row.geometry.x, y=row.geometry.y, fdir=fdir, xytype='index')
+        if np.sum(catch) < min_area:
+            continue
+        trees[catch] = row['TID']
+
+    mask = trees != 0
+    results = ({'properties': {'TID': v}, 'geometry': s} for s, v in shapes(trees, mask=mask, transform=profile['transform']))
+
+    # Convert results to a GeoDataFrame
+    gdf = gpd.GeoDataFrame.from_features(list(results), crs=profile['crs'])
+
+    # Save the GeoDataFrame to a file
+    gdf.to_file(output)
