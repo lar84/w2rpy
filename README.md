@@ -146,3 +146,14 @@
 	- photo_file: file path to PNG/JPG of gravel bar with clear identifying object in the photo.
 	- obj_color: color (or RGBA) or object used to scale the image, best if this object is a solid, bright, and unique image. Defaults are for write-in-the-rain notebook.
 	- obj_size_mm: length of object along major axis in mm. Default is for write-in-the-rain notebook. 
+
+**delineate_trees(ch_file, output, canopy_floor=10, min_ht=60, max_ht=120, min_area=20, combine_dist=5)**
+- Saves a set of polygons representing delineated trees from a canopy height model.
+- Input options:
+	-  ch_file: Path to the canopy height model raster file.
+    	-  output: Path to save the resulting tree locations shapefile.
+    	-  canopy_floor: Height threshold to consider the ground level of the canopy (default 15).
+    	-  min_ht: Minimum height to consider a detection as a tree (default 50).
+    	-  max_ht: Maximum height to still consider the detection as a tree (default 100).
+    	-  min_area: Minimum area for a tree detection to be considered valid (default 20).
+    	-  combine_dist: Number of pixels within which to combine tree points (default 5).
