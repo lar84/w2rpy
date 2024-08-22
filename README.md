@@ -157,3 +157,13 @@
     	-  max_ht: Maximum height to still consider the detection as a tree (default 100).
     	-  min_area: Minimum area for a tree detection to be considered valid (default 20).
     	-  combine_dist: Number of pixels within which to combine tree points (default 5).
+
+**get_volume(terrain, df, target_elev='ELEVATION', method='cut', units='ft', save=None)**
+- Calculate the volumes of cut or fill required for grading within polygons to a target elevation.
+- Input options:
+	-  terrain: Path to the terrain raster file. Can be either DEM or REM.
+    	-  df: Path to the shapefile or a GeoDataFrame containing the polygons.
+    	-  target_elev: The target elevation or the column in df specifying target elevations for each polygon.
+    	-  method: Method to calculate volumes ('cut' or 'fill').
+    	-  units: Units of measurement for volume output ('ft' for cubic yards, 'm' for cubic meters).
+    	-  save: File path where the resulting GeoDataFrame with volume calculations is saved, otherwise return dataframe.
