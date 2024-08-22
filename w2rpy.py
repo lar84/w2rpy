@@ -1025,8 +1025,14 @@ def htab_1D(station, elevation, slope, D50, max_depth=10, breaks=None, save=None
         # Split station and elevation arrays at the calculated indices
         sta = np.split(station, indices)
         sta = [s for s in sta if (elevation[np.searchsorted(station, s)] < wse).any()]
-        sta = [np.append(s, station[np.argwhere(station == max(s)) + 1]) for s in sta]
-        end_sta = [np.argwhere(station == s[-1]) for s in sta]
+        
+        # Extend each array with the next station value after max(s), if applicable
+        sta = [np.append(s, station[np.argwhere(station == max(s)) + 1][-1])
+            if np.argwhere(station == max(s)) < len(station) - 1 else s
+            for s in sta]
+        
+        # Store the index of the last element in each sub-array in end_sta
+        end_sta = [np.argwhere(station == s[-1])[0][0] for s in sta]
         
         elev = np.split(elevation, indices)
         elev = [e for e in elev if (e < wse).any()]
@@ -1442,3 +1448,89 @@ def delineate_trees(ch_file, output, canopy_floor=15, min_ht=50, max_ht=100, min
 
     # Save the GeoDataFrame to a file
     gdf.to_file(output)
+
+def get_volume(terrain, df, target_elev='ELEVATION', method='cut', units='ft', save=None):
+    """
+    Calculate the volumes of cut or fill required for grading within polygons to a target elevation.
+
+    Parameters:
+    terrain : str
+        Path to the terrain raster file.
+    df : str or GeoDataFrame
+        Path to the shapefile or a GeoDataFrame containing the polygons.
+    target_elev : str or numeric
+        The target elevation or the column in df specifying target elevations for each polygon.
+    method : str
+        Method to calculate volumes ('cut' or 'fill').
+    units : str
+        Units of measurement for volume output ('ft' for cubic yards, 'm' for cubic meters).
+    save : str, optional
+        File path where the resulting GeoDataFrame with volume calculations is saved, otherwise return a dataframe.
+
+    Returns:
+    df : GeoDataFrame
+        GeoDataFrame with additional column 'Vol' for volumes, unless saved to file.
+    """
+    
+    # Load the terrain raster
+    with rio.open(terrain) as src:
+        arr = src.read(1)
+        transform = src.transform
+        crs = src.crs
+
+    # Load the polygon data
+    if isinstance(df, str):
+        df = gpd.read_file(df)
+    df = df.to_crs(crs)
+    
+    # Assuming target_elev is a scalar numeric value...
+    if np.isscalar(target_elev) and isinstance(target_elev, (int, float)):
+        arr -= target_elev
+        
+        if method == 'cut':
+            arr = np.where(arr < 0, 0, arr)
+        elif method == 'fill':
+            arr = np.where(arr > 0, 0, -arr)
+        else:
+            print("Method must be 'cut' or 'fill'.")
+            return
+
+        df['Vol'] = [np.sum(arr[rio.features.geometry_mask([geom], arr.shape, transform, invert=True)]) for geom in df.geometry]
+
+    # Assuming target_elev is a column name in df...
+    elif isinstance(target_elev, str): 
+        df['Vol'] = np.nan
+
+        for idx, row in df.iterrows():
+            target = row[target_elev]
+            arr_mod = arr - target
+            
+            if method == 'cut':
+                arr_mod = np.where(arr_mod < 0, 0, arr_mod)
+            elif method == 'fill':
+                arr_mod = np.where(arr_mod > 0, 0, -arr_mod)
+            else:
+                print("Method must be 'cut' or 'fill'.")
+                return
+
+            mask = rio.features.geometry_mask([row.geometry], arr.shape, transform, invert=True)
+            df.at[idx, 'Vol'] = np.sum(arr_mod[mask])
+    else:
+        print('Target elevation must be a scalar or column name.')
+        return
+
+    # Convert volumes to specified units
+    if units == 'ft':
+        df['Vol_KCY'] = df['Vol'] / transform[0] ** 3 / 1000
+    elif units == 'm':
+        df['Vol_KCY'] = df['Vol'] / transform[0] ** 3 * 1.308 / 1000
+    else:
+        print("Units must be 'ft' or 'm'.")
+        return
+
+    # Save or return the GeoDataFrame
+    if save:
+        df.to_file(save)
+        print(f'Volumes calculated and saved to {save}')
+    else:
+        return df
