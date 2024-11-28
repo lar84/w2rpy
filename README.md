@@ -7,10 +7,12 @@ To install or update:
 ```python
 pip install w2rpy
 pip install --upgrade w2rpy
+
 ```
 
-```markdown
+
 To create a REM and estimate wetland extents:
+
 
 ```python
 import w2rpy as w2r
@@ -24,9 +26,10 @@ haws = '/haws.tif'
 w2r.create_REM(xs,dem,haws)
 
 inun_extents = w2r.inundate(haws,[1],remove_holes=True)
+
 ```
 
-```markdown
+
 ## Documentation
 
 **terrain(dem_file)**
