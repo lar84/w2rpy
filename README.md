@@ -1,9 +1,32 @@
+
 # w2rpy
 
-**See full code on [GitHub](https://github.com/lar84/w2rpy)**
+**[GitHub](https://github.com/lar84/w2rpy)   [PyPI](https://pypi.org/project/w2rpy)**
 
-**Install code from [PyPI](https://pypi.org/project/w2rpy)**
+To install or update:
+```python
+pip install w2rpy
+pip install --upgrade w2rpy
+```
 
+```markdown
+To create a REM and estimate wetland extents:
+
+```python
+import w2rpy as w2r
+
+dem = '/dem.tif'
+valley_centerline = '/VCL.shp'
+
+xs = w2r.get_xs(valley_centerline)
+
+haws = '/haws.tif'
+w2r.create_REM(xs,dem,haws)
+
+inun_extents = w2r.inundate(haws,[1],remove_holes=True)
+```
+
+```markdown
 ## Documentation
 
 **terrain(dem_file)**
@@ -140,12 +163,12 @@
 	- channel_roughness: Manning's roughness for channel, only used if channel_area is provided
  	- save: optional file path to save htab as excel rather than returning a dataframe object.
 
-**pebble_count(photo_file, obj_color='yellow', obj_size_mm=190.5)**
+**pebble_count(photos, obj_size_mm, method='rapid')**
 - Creates classified image with grain size distribution and CSV file of raw data in the same folder as your image.
 - Input options:
-	- photo_file: file path to PNG/JPG of gravel bar with clear identifying object in the photo.
-	- obj_color: color (or RGBA) or object used to scale the image, best if this object is a solid, bright, and unique image. Defaults are for write-in-the-rain notebook.
-	- obj_size_mm: length of object along major axis in mm. Default is for write-in-the-rain notebook. 
+	- photos: list of file paths to PNG/JPG of gravel bar with clear identifying object in the photo.
+	- obj_size_mm: length of object along major axis in mm.
+	- method: "rapid" for a faster Wolman pebble count or "detailed" for an area-weighted count of most visible grains 
 
 **delineate_trees(ch_file, output, canopy_floor=10, min_ht=60, max_ht=120, min_area=20, combine_dist=5)**
 - Saves a set of polygons representing delineated trees from a canopy height model.
@@ -158,12 +181,20 @@
     	-  min_area: Minimum area for a tree detection to be considered valid (default 20).
     	-  combine_dist: Number of pixels within which to combine tree points (default 5).
 
-**get_volume(terrain, df, target_elev='ELEVATION', method='cut', units='ft', save=None)**
-- Calculate the volumes of cut or fill required for grading within polygons to a target elevation.
+**def HSI(dep_raster,vel_raster,curve,output)**
+- Determines habitat suitability index given depth and velocity rasters. Values range from 0-1. Curves based on WDFW Instream Flow Guidelines.
 - Input options:
-	-  terrain: Path to the terrain raster file. Can be either DEM or REM.
-    	-  df: Path to the shapefile or a GeoDataFrame containing the polygons.
-    	-  target_elev: The target elevation or the column in df specifying target elevations for each polygon.
-    	-  method: Method to calculate volumes ('cut' or 'fill').
-    	-  units: Units of measurement for volume output ('ft' for cubic yards, 'm' for cubic meters).
-    	-  save: File path where the resulting GeoDataFrame with volume calculations is saved, otherwise return dataframe.
+	-  dep_raster: Path to the depth raster file.
+	-  vel_raster: Path to the velocity raster file.
+	-  curve: Species and lifestage curve, options are: 
+		-"Adult Chinook Spawning Large River"
+		-"Adult Chinook Spawning Small River"
+		-"Juvenile Chinook Rearing"
+		-"Adult Coho Spawning"
+		-"Juvenile Coho Rearing"
+		-"Adult Sockeye Spawning"
+		-"Juvenile/Adult Rainbow Trout Rearing"
+		-"Spring Chinook Holding"
+		-"O. mykiss Juvenile"
+    	-  output: Path to save the resulting HSI raster.
+   
