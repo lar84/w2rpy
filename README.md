@@ -1,34 +1,116 @@
-
 # w2rpy
 
-**[GitHub](https://github.com/lar84/w2rpy)   [PyPI](https://pypi.org/project/w2rpy)**
+**[GitHub](https://github.com/lar84/w2rpy)**
+
+**[PyPI](https://pypi.org/project/w2rpy)**
 
 To install or update:
+
 ```python
 pip install w2rpy
 pip install --upgrade w2rpy
-
 ```
 
+PyTorch and Meta's SegmentAnything model must be installed separately to run the pebble_count function.
+Download a pytorch wheel specific to your GPU [here](https://pytorch.org/get-started/locally/).
+Download SegmentAnything model checkpoints [here](https://github.com/facebookresearch/segment-anything?tab=readme-ov-file#model-checkpoints).
+And install the SegmentAnything python package:
+```python
+pip install https://github.com/facebookresearch/segment-anything/archive/master.zip
+```
 
-To create a REM and estimate wetland extents:
-
+To create a REM and estimate channel extent:
 
 ```python
 import w2rpy as w2r
+import matplotlib.pyplot as plt
+import rasterio as rio
+from rasterio.plot import show
 
 dem = '/dem.tif'
 valley_centerline = '/VCL.shp'
 
-xs = w2r.get_xs(valley_centerline)
+xs = w2r.xs(valley_centerline,1500,100)
 
-haws = '/haws.tif'
-w2r.create_REM(xs,dem,haws)
+haws = r'C:/users/lrussell/downloads/haws.tif'
+w2r.create_REM(dem,xs,haws)
 
-inun_extents = w2r.inundate(haws,[1],remove_holes=True)
+channel = w2r.inundate(haws,[3],remove_holes=True,largest_only=True)
 
+
+fig,ax = plt.subplots(1,1)
+
+with rio.open(haws) as src:
+    show(src,ax=ax,cmap='viridis',vmin=-1,vmax=10,alpha=0.75)
+    
+xs.plot(ax=ax,color='k',lw=0.5)
+channel.plot(ax=ax,ec='b',fc='gray',alpha=0.5)
 ```
+![image](https://github.com/lar84/w2rpy/blob/main/images/w2rpy_fig1.png)
 
+
+To estimate a ratinge curve:
+
+```python
+import w2rpy as w2r
+import geopandas as gpd
+import matplotlib.pyplot as plt
+
+import geopandas as gpd
+
+# Get inundation polygons over a range of relative elevations
+inundation_polygons = w2r.inundate(haws,range(3,11),largest_only=True)
+
+# clip polygons to area of hydraulic calcs
+aoi = gpd.read_file(r'C:/Users/lrussell/Downloads/aoi_clip.shp')
+inundation_polygons.geometry = inundation_polygons.intersection(aoi.union_all())
+channel.geometry = channel.intersection(aoi.union_all())
+
+# run htab calcs
+htab = w2r.htab_2D(haws,
+            extents=inundation_polygons,
+            vcl=valley_centerline,
+            slope=0.01,
+            roughness=0.1,
+            channel_area=channel,
+            channel_roughness=0.032)
+
+
+fig,ax = plt.subplots(1,2)
+
+inundation_polygons.plot(ax=ax[0],cmap='Blues_r',ec='k',alpha=0.1)
+
+ax[1].plot(htab.Q,htab.WSE,color='k')
+ax[1].scatter(htab.Q,htab.WSE,color='k')
+
+ax[1].set_xlabel('Discharge (cfs)')
+ax[1].set_ylabel('Relative WSE (ft)')
+
+ax[1].grid()
+```
+![image](https://github.com/lar84/w2rpy/blob/main/images/w2rpy_fig2.png)
+
+To run a photo-based pebble count:
+```python
+w2r.pebble_count(['/pebble_photo.png'],obj_size_mm=180)
+```
+![image](https://github.com/lar84/w2rpy/blob/main/images/w2rpy_fig3.png)
+
+To run a habitat suitability (HSI) analysis:
+```python
+dep = r'/depth_raster.tif'
+vel = r'/velocity_raster.tif'
+w2r.HSI(dep,vel,'Adult Coho Spawning',r'/HSI_output.tif')
+```
+![image](https://github.com/lar84/w2rpy/blob/main/images/w2rpy_fig4.png)
+
+To run a tree delineation analysis for trees between 50 and 100 feet tall:
+```python
+ch = '/canopy_height.tif'
+output = r'/trees.shp'
+w2r.delineate_trees(ch, output)
+```
+![image](https://github.com/lar84/w2rpy/blob/main/images/w2rpy_fig5.png)
 
 ## Documentation
 
@@ -55,7 +137,7 @@ inun_extents = w2r.inundate(haws,[1],remove_holes=True)
  	- snap_threshold: threshold for snapping pour point to the flow accumulation raster. Defaults to number of pixels/10.
  	- save: optional file path to save catchment as shapefile rather than returning a geodataframe object.
 
-**get_xs(cl, xs_length, spacing, save=None)**
+**xs(cl, xs_length, spacing, save=None)**
 - Returns a geodataframe of cross-sections.
 - Input options:
  	- cl: centerline, or any lines, to generate cross-sections along.
@@ -63,7 +145,7 @@ inun_extents = w2r.inundate(haws,[1],remove_holes=True)
  	- spacing: distance between cross-sections on cl. 
  	- save: optional file path to save cross-sections as shapefile rather than returning a geodataframe object.
 
-**get_points(lines, spacing, ep=True, save=None)**
+**points(lines, spacing, ep=True, save=None)**
 - Returns a geodataframe of cross-sections.
 - Input options:
  	- lines: centerline, or any lines, to generate cross-sections along.
@@ -200,4 +282,13 @@ inun_extents = w2r.inundate(haws,[1],remove_holes=True)
 		-"Spring Chinook Holding"
 		-"O. mykiss Juvenile"
     	-  output: Path to save the resulting HSI raster.
-   
+ 
+**Dcrit(shear_raster,output,tc=0.06,psed=162.3128,pwater=62.428)**
+- Determines critical grain size (Dcrit) using Shields' equation. .
+- Input options:
+	-  shear_raster: Path to the shear stress (lbs/ft^2) raster file.
+   	-  tc: dimensionless critical shear, use values between 0.045 and 0.06.
+   	-  psed: density of water (lbs/ft^3)
+   	-  pwater: density of water (lbs/ft^3)
+    	-  output: Path to save the resulting Dcrit raster.
+
