@@ -10,6 +10,7 @@ import numpy as np
 from shapely.geometry import Point,LineString,Polygon,MultiPolygon,shape,box
 import geopandas as gpd
 import rasterio as rio
+from rasterio.features import shapes
 from rasterio.mask import mask
 from rasterio.merge import merge
 from rasterio import features
@@ -17,10 +18,15 @@ from rasterio.warp import Resampling
 from rasterio.warp import reproject,calculate_default_transform
 from rasterio.io import MemoryFile
 from pysheds.grid import Grid
+from pysheds.sview import Raster
+from scipy.ndimage import gaussian_filter,zoom
 from scipy.integrate import trapezoid
 from scipy.interpolate import RBFInterpolator,interp1d
 import matplotlib.pyplot as plt
 from matplotlib import colors
+import matplotlib.patches as patches
+from matplotlib.widgets import PolygonSelector
+from matplotlib.path import Path
 import copy
 try:
     from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
@@ -135,53 +141,60 @@ def streamlines(terrain, pour_point, threshold=None, snap_threshold=None, save=N
     if isinstance(pour_point, str):
         pour_point = gpd.read_file(pour_point)
     pour_point = pour_point.to_crs(terrain.crs)
-    pour_point = pour_point.geometry.values[0]
     
-    xy = grid.snap_to_mask(terrain.acc > snap_threshold, [pour_point.x, pour_point.y], return_dist=False)
-    x, y = xy[0, 0], xy[0, 1]
-
-    # Delineate the catchment area
-    catchment = grid.catchment(x=x, y=y, fdir=terrain.fdir, xytype='coordinate')
-    grid.clip_to(catchment)
-
-    # Extract stream network using flow direction and accumulation arrays
-    streams = grid.extract_river_network(terrain.fdir, terrain.acc > threshold)
-    
-    # Convert the extracted streams to a GeoDataFrame
-    lines = gpd.GeoDataFrame(streams, columns=['geometry'], crs=terrain.crs)
-    lines['FID'] = range(len(lines))
-    
-    # Find upstream and downstream neighbors for each stream segment
-    for idx, geom in lines.iterrows():
-        # Define upstream and downstream points
-        upstream_point = Point(geom.geometry.coords[0])
-        downstream_point = Point(geom.geometry.coords[-1])
+    all_lines = gpd.GeoDataFrame([], columns=['WSID','FID','upstream','downstream','dist_to_pp','geometry'], crs=terrain.crs)
+    for i,row in pour_point.interrows():
+        pp = row.geometry
         
-        # Identify neighboring stream segments
-        lines['upstream'] = lines.geometry.apply(lambda x: x.distance(upstream_point) < 0.01 and not np.array_equal(x.coords[-1], geom.geometry.coords[0]))
-        lines['downstream'] = lines.geometry.apply(lambda x: x.distance(downstream_point) < 0.01 and not np.array_equal(x.coords[0], geom.geometry.coords[-1]))
-
-    # Calculate distances to pour point using a recursive function
-    def calculate_distance_to_pour_point(line_fid, accumulated_distance=0):
-        current_line = lines.loc[line_fid]
-        lines.loc[line_fid, 'distance_to_pour_point'] = accumulated_distance
-        downstream_fid = lines.loc[line_fid, 'downstream']
+        xy = grid.snap_to_mask(terrain.acc > snap_threshold, [pp.x, pp.y], return_dist=False)
+        x, y = xy[0, 0], xy[0, 1]
+    
+        # Delineate the catchment area
+        catchment = grid.catchment(x=x, y=y, fdir=terrain.fdir, xytype='coordinate')
+        grid.clip_to(catchment)
+    
+        # Extract stream network using flow direction and accumulation arrays
+        streams = grid.extract_river_network(terrain.fdir, terrain.acc > threshold)
         
-        if not downstream_fid.empty:
-            next_distance = accumulated_distance + current_line.geometry.length
-            calculate_distance_to_pour_point(downstream_fid.values[0], next_distance)
-
-    # Start with the stream segment closest to the pour point
-    pour_point_fid = lines[lines['downstream'].isnull()].index[0]
-    calculate_distance_to_pour_point(pour_point_fid)
-
+        # Convert the extracted streams to a GeoDataFrame
+        lines = gpd.GeoDataFrame(streams, columns=['geometry'], crs=terrain.crs)
+        lines['FID'] = range(len(lines))
+        
+        # Find upstream and downstream neighbors for each stream segment
+        for idx, geom in lines.iterrows():
+            # Define upstream and downstream points
+            upstream_point = Point(geom.geometry.coords[0])
+            downstream_point = Point(geom.geometry.coords[-1])
+            
+            # Identify neighboring stream segments
+            lines['upstream'] = lines.geometry.apply(lambda x: x.distance(upstream_point) < 0.01 and not np.array_equal(x.coords[-1], geom.geometry.coords[0]))
+            lines['downstream'] = lines.geometry.apply(lambda x: x.distance(downstream_point) < 0.01 and not np.array_equal(x.coords[0], geom.geometry.coords[-1]))
+    
+        # Calculate distances to pour point using a recursive function
+        def calculate_distance_to_pour_point(line_fid, accumulated_distance=0):
+            current_line = lines.loc[line_fid]
+            lines.loc[line_fid, 'dist_to_pp'] = accumulated_distance
+            downstream_fid = lines.loc[line_fid, 'downstream']
+            
+            if not downstream_fid.empty:
+                next_distance = accumulated_distance + current_line.geometry.length
+                calculate_distance_to_pour_point(downstream_fid.values[0], next_distance)
+    
+        # Start with the stream segment closest to the pour point
+        pour_point_fid = lines[lines['downstream'].isnull()].index[0]
+        calculate_distance_to_pour_point(pour_point_fid)
+        
+        lines['WSID'] = i
+        all_lines = pd.concat([all_lines,lines])
+    
+    all_lines.crs = terrain.crs
     if save:
         # Save the stream network to a file
-        lines.to_file(save)
+        all_lines.to_file(save)
         print(f'Stream network saved to {save}')
     else:
         # Return the stream network GeoDataFrame
-        return lines
+        return all_lines
     
 def catchment(terrain, pour_point, snap_threshold=None, save=None):
     """
@@ -214,38 +227,47 @@ def catchment(terrain, pour_point, snap_threshold=None, save=None):
     if isinstance(pour_point, str):
         pour_point = gpd.read_file(pour_point)
     pour_point = pour_point.to_crs(terrain.crs)
-    pour_point = pour_point.geometry.values[0]
+    
+    
+    all_cm = gpd.GeoDataFrame([], columns=['WSID','geometry'], crs=terrain.crs)
+    for i,row in pour_point.interrows():
+        pp = row.geometry
 
-    # Extract coordinates of the pour point
-    x0, y0 = pour_point.x, pour_point.y
-
-    # Find the nearest flow accumulated cell that exceeds the snap threshold
-    xy = grid.snap_to_mask(terrain.acc > snap_threshold, np.column_stack([x0, y0]), return_dist=False)
-    x, y = xy[0, 0], xy[0, 1]
-
-    # Delineate the catchment using the snapped coordinates
-    catch = grid.catchment(x=x, y=y, fdir=terrain.fdir, xytype='coordinate')
-
-    # Clip the grid to the delineated catchment
-    grid.clip_to(catch)
-
-    # Polygonize the clipped grid to get the catchment area
-    shapes = grid.polygonize()
-    coords = np.asarray(next(shapes)[0]['coordinates'][0])
-    catchment_poly = Polygon(coords)
-
-    # Create a GeoDataFrame for the catchment polygon
-    cm = gpd.GeoDataFrame([], geometry=[catchment_poly], crs=terrain.crs)
-
+        # Extract coordinates of the pour point
+        x0, y0 = pp.x, pp.y
+    
+        # Find the nearest flow accumulated cell that exceeds the snap threshold
+        xy = grid.snap_to_mask(terrain.acc > snap_threshold, np.column_stack([x0, y0]), return_dist=False)
+        x, y = xy[0, 0], xy[0, 1]
+    
+        # Delineate the catchment using the snapped coordinates
+        catch = grid.catchment(x=x, y=y, fdir=terrain.fdir, xytype='coordinate')
+    
+        # Clip the grid to the delineated catchment
+        grid.clip_to(catch)
+    
+        # Polygonize the clipped grid to get the catchment area
+        shapes = grid.polygonize()
+        coords = np.asarray(next(shapes)[0]['coordinates'][0])
+        catchment_poly = Polygon(coords)
+    
+        # Create a GeoDataFrame for the catchment polygon
+        cm = gpd.GeoDataFrame([], geometry=[catchment_poly], crs=terrain.crs)
+        cm['WSID'] = i
+        
+        all_cm = pd.concat([all_cm,cm])
+        
+    all_cm.crs = terrain.crs
+    
     # Save or return the GeoDataFrame
     if save:
-        cm.to_file(save)
+        all_cm.to_file(save)
         print('Catchment delineated and saved to:', save)
     else:
         print('Catchment delineated')
-        return cm
+        return all_cm
     
-def get_xs(cl, xs_length, spacing, save=None):
+def xs(cl, xs_length, spacing, save=None):
     """
     Generate perpendicular cross-sectional lines along a centerline at specified intervals.
 
@@ -253,7 +275,7 @@ def get_xs(cl, xs_length, spacing, save=None):
     cl : str or GeoDataFrame
         Path to the centerline shapefile or a GeoDataFrame containing the centerline geometries.
     xs_length : float
-        Half the total length of each cross-sectional line. The full length will be twice this value.
+        Total length of each cross-sectional line.
     spacing : float
         Distance between the centers of consecutive cross-sectional lines along the centerline.
     save : str, optional
@@ -269,44 +291,45 @@ def get_xs(cl, xs_length, spacing, save=None):
         cl = gpd.read_file(cl)
 
     # Prepare an empty GeoDataFrame to store cross-sectional lines
-    xs_lines = gpd.GeoDataFrame([], columns=['CSID', 'Distance', 'geometry'], crs=cl.crs)
+    xs_lines = gpd.GeoDataFrame(columns=['CSID', 'Distance', 'geometry'], crs=cl.crs)
 
     # Iterate through each line in the centerline GeoDataFrame
     for idx, row in cl.iterrows():
-        num_xsecs = int(row.geometry.length / spacing)
+        geom = row.geometry
+        num_xsecs = int(geom.length // spacing)
         
-        # Generate cross-sections for each segment defined by the spacing
-        for xs in range(1, num_xsecs):
-            point = row.geometry.interpolate(xs * spacing)
-            pointA = row.geometry.interpolate(xs * spacing - xs_length)
-            pointB = row.geometry.interpolate(xs * spacing + xs_length)
+        for xs in range(1, num_xsecs + 1):
+            distance = xs * spacing
+            point = geom.interpolate(distance)  # Center of the cross-section
             
-            # Calculate the angle of the line to find the perpendicular
-            deltaX = pointA.x - pointB.x
-            deltaY = pointA.y - pointB.y
-            if deltaX == 0:
-                deltaX = 0.0000000000001  # Prevent division by zero
-            slope = deltaY / deltaX
-            theta = np.arctan(slope)
-            new_theta = (theta + np.pi / 2) % np.pi  # Perpendicular angle
-            
-            # Calculate endpoints of the cross-sectional line
-            line_end1 = Point(point.x + xs_length * np.cos(new_theta), point.y + xs_length * np.sin(new_theta))
-            line_end2 = Point(point.x - xs_length * np.cos(new_theta), point.y - xs_length * np.sin(new_theta))
-            
-            line = LineString([line_end1, line_end2])
-            
-            # Store the cross-section in the GeoDataFrame
-            xs_lines.loc[len(xs_lines)] = [idx, xs * spacing, line]
-    
-    # Optionally save to file or return the GeoDataFrame
+            # Tangent vector at the point (derivative of the curve)
+            tangent = geom.interpolate(distance + 0.01).coords[0]
+            center = point.coords[0]
+            dx = tangent[0] - center[0]
+            dy = tangent[1] - center[1]
+            norm = np.hypot(dx, dy)
+            unit_tangent = (dx / norm, dy / norm)
+
+            # Perpendicular vector (rotated by 90 degrees)
+            perp_vector = (-unit_tangent[1], unit_tangent[0])
+
+            # Endpoints of the cross-sectional line
+            end1 = (center[0] + xs_length/2 * perp_vector[0], center[1] + xs_length/2 * perp_vector[1])
+            end2 = (center[0] - xs_length/2 * perp_vector[0], center[1] - xs_length/2 * perp_vector[1])
+            line = LineString([end1, end2])
+
+            # Append the line to the GeoDataFrame
+            xs_lines.loc[len(xs_lines)] = [idx, distance, line]
+
+    # Save or return the GeoDataFrame
+    xs_lines.crs = cl.crs
     if save:
         xs_lines.to_file(save)
         print(f"Cross-sectional lines saved to {save}")
     else:
         return xs_lines
 
-def get_points(lines, spacing, ep=True, save=None):
+def points(lines, spacing, ep=True, save=None):
     """
     Generate points at specified intervals along line geometries.
 
@@ -330,7 +353,7 @@ def get_points(lines, spacing, ep=True, save=None):
         lines = gpd.read_file(lines)
 
     # Define a function to create points including the endpoint
-    def _get_points_ep(row):
+    def _points_ep(row):
         # Create points including the end point of the line
         intervals = np.arange(0, row.geometry.length, spacing).tolist() + [row.geometry.length]
         points = [row.geometry.interpolate(distance) for distance in intervals]
@@ -341,7 +364,7 @@ def get_points(lines, spacing, ep=True, save=None):
         }, crs=lines.crs)
 
     # Define a function to create points excluding the endpoint
-    def _get_points(row):
+    def _points(row):
         # Create points excluding the end point of the line
         intervals = np.arange(0, row.geometry.length, spacing)
         points = [row.geometry.interpolate(distance) for distance in intervals]
@@ -353,13 +376,15 @@ def get_points(lines, spacing, ep=True, save=None):
 
     # Apply the appropriate function to each line
     if ep:
-        lines['points'] = lines.apply(_get_points_ep, axis=1)
+        lines['points'] = lines.apply(_points_ep, axis=1)
     else:
-        lines['points'] = lines.apply(_get_points, axis=1)
+        lines['points'] = lines.apply(_points, axis=1)
 
     # Concatenate all points into a single GeoDataFrame
     points = pd.concat(lines['points'].tolist(), ignore_index=True)
 
+    del lines['points']
+    points.crs = lines.crs
     # Save or return the points GeoDataFrame
     if save:
         points.to_file(save)
@@ -437,13 +462,15 @@ def inundate(raster, rel_wse_list, largest_only=False, invert=False, remove_hole
         inundated.geometry = inundated.geometry.apply(_remove_holes)
 
     # Save or return the GeoDataFrame
+    inundated.geometry = gpd.GeoSeries(inundated.geometry)
+    inundated.crs = crs
     if save:
         inundated.to_file(save)
         print(f'Inundation data saved to {save}')
     else:
         return inundated
 
-def edit_raster(raster, output, crs=None, resample=None, resample_method='bilinear', clip=None, nodata=None):
+def edit_raster(raster, output, crs=None, resample=None, resample_method='bilinear', clip=None, nodata=None, match=None, match_transform=None, res=None):
     """
     Edit a raster for various transformations including clipping, nodata handling, resampling, and reprojection.
 
@@ -455,7 +482,7 @@ def edit_raster(raster, output, crs=None, resample=None, resample_method='biline
     crs : CRS or str, optional
         The target coordinate reference system to which to reproject the raster.
     resample : float or None, optional
-        Scaling factor to resample the raster; less than 1 to downscale, more than 1 to upscale.
+        Pixel size to resample the raster to.
     resample_method : str, optional
         Method used for resampling ('bilinear', 'nearest', 'mean').
     clip : str or GeoDataFrame, optional
@@ -476,86 +503,123 @@ def edit_raster(raster, output, crs=None, resample=None, resample_method='biline
 
     # Open the source raster and initialize the first MemoryFile
     with rio.open(raster) as src:
-        profile = src.profile.copy()
+        og_profile = src.profile.copy()
+        profile = og_profile.copy()
+        
         if nodata is not None:
             profile['nodata'] = nodata
         profile['driver'] = 'GTiff'
+        profile['BIGTIFF'] = 'YES'
         
-        with MemoryFile() as memfile1:
-            with memfile1.open(**profile) as mem_dst:
-                mem_dst.write(src.read())
+        memfile1 = MemoryFile()
+        memfile1.open(**profile).write(src.read())
         
-            # Handling the clip operation
-            if clip is not None:
-                with MemoryFile() as memfile2:
-                    with memfile1.open() as src:
-                        if isinstance(clip, str):
-                            clip = gpd.read_file(clip)
-                        clip = clip.to_crs(src.crs)
-                        masked_array, masked_transform = rio.mask.mask(src, clip.geometry, crop=True)
-                        profile.update({
-                            'transform': masked_transform,
-                            'width': masked_array.shape[2],
-                            'height': masked_array.shape[1]
-                        })
-                        with memfile2.open(**profile) as dst:
-                            dst.write(masked_array)
-                    memfile1 = memfile2
-            
-            # Handling the resample operation
-            if resample:
-                with MemoryFile() as memfile2:
-                    with memfile1.open() as src:
-                        new_height = int(src.height * resample)
-                        new_width = int(src.width * resample)
-                        data = src.read(
-                            out_shape=(src.count, new_height, new_width),
-                            resampling=mdict[resample_method]
-                        )
-                        transform = src.transform * src.transform.scale(
-                            (src.width / data.shape[-1]),
-                            (src.height / data.shape[-2])
-                        )
-                        profile.update({
-                            'transform': transform,
-                            'width': new_width,
-                            'height': new_height
-                        })
-                        with memfile2.open(**profile) as dst:
-                            dst.write(data)
-                    memfile1 = memfile2
-            
-            # Handling the reprojection operation
-            if crs:
-                with MemoryFile() as memfile2:
-                    with memfile1.open() as src:
-                        transform, width, height = calculate_default_transform(
-                            src.crs, crs, src.width, src.height, *src.bounds
-                        )
-                        profile.update({
-                            'crs': crs,
-                            'transform': transform,
-                            'width': width,
-                            'height': height
-                        })
-                        with memfile2.open(**profile) as dst:
-                            for i in range(1, src.count + 1):
-                                reproject(
-                                    source=rio.band(src, i),
-                                    destination=rio.band(dst, i),
-                                    src_transform=src.transform,
-                                    src_crs=src.crs,
-                                    dst_transform=transform,
-                                    dst_crs=crs,
-                                    resampling=mdict[resample_method]
-                                )
-                    memfile1 = memfile2
+        # Handling the clip operation
+        if clip is not None:
+            with MemoryFile() as memfile2:
+                with memfile1.open() as src:
+                    if isinstance(clip, str):
+                        clip = gpd.read_file(clip)
+                    clip = clip.to_crs(src.crs)
+                    masked_array, masked_transform = rio.mask.mask(src, clip.geometry, crop=True)
+                    profile.update({
+                        'transform': masked_transform,
+                        'width': masked_array.shape[2],
+                        'height': masked_array.shape[1]
+                    })
+                    
+                    with memfile2.open(**profile) as dst:
+                        dst.write(masked_array)
+                memfile1 = MemoryFile(memfile2.read())
+                
+        
+        # Handling the resample operation
+        if resample:
+            with MemoryFile() as memfile2:
+                with memfile1.open() as src:
+                    transform = src.transform
+                    
+                    new_transform = rio.Affine(resample, transform.b, transform.c, transform.d, -resample, transform.f)
+                    
+                    new_width = int((src.bounds.right - src.bounds.left) / resample)
+                    new_height = int((src.bounds.top - src.bounds.bottom) / resample)
+                    
+                    data = src.read(
+                        out_shape=(src.count, new_height, new_width),
+                        resampling=mdict[resample_method]
+                    )
 
-            # Saving the final raster
-            with memfile1.open() as final_src:
-                with rio.open(output, 'w', **final_src.profile) as final_dst:
-                    final_dst.write(final_src.read())
+                    profile.update({
+                        'transform': new_transform,
+                        'width': new_width,
+                        'height': new_height
+                    })
+                    
+                    with memfile2.open(**profile) as dst:
+                        dst.write(data)
+                memfile1 = MemoryFile(memfile2.read())
+        
+        # Handling the reprojection operation
+        if crs:
+            with MemoryFile() as memfile2:
+                with memfile1.open() as src:
+                    if res is None:
+                        res = src.res
+                    transform, width, height = calculate_default_transform(
+                        src.crs, crs, src.width, src.height, *src.bounds, resolution=res
+                    )
+                    profile.update({
+                        'crs': crs,
+                        'transform': transform,
+                        'width': width,
+                        'height': height
+                    })
+                    with memfile2.open(**profile) as dst:
+                        for i in range(1, src.count + 1):
+                            reproject(
+                                source=rio.band(src, i),
+                                destination=rio.band(dst, i),
+                                src_transform=src.transform,
+                                src_crs=src.crs,
+                                dst_transform=transform,
+                                dst_crs=crs,
+                                resampling=mdict[resample_method]
+                            )
+                                                    
+                memfile1 = MemoryFile(memfile2.read())
+                
+        # Handling the reprojection operation to match a raster
+        if match:
+            with rio.open(match) as src:
+                target_profile = src.profile.copy()
+                
+            with MemoryFile() as memfile2:
+                with memfile1.open() as src:
+                    target_profile['dtype'] = src.profile['dtype']
+                    target_profile['count'] = src.profile['count']
+                    target_profile['nodata'] = src.profile['nodata']
+                    
+                    with memfile2.open(**target_profile) as dst_match:
+                        # Reproject the raster to match the affine transform and CRS
+                        for i in range(1, src.count + 1):
+                            reproject(
+                                source=rio.band(src, i),
+                                destination=rio.band(dst_match, i),
+                                src_transform=src.profile['transform'],
+                                src_crs=src.crs,
+                                dst_transform=target_profile['transform'],
+                                dst_crs=target_profile['crs'],
+                                resampling=mdict[resample_method])
+                                                    
+                memfile1 = MemoryFile(memfile2.read())
 
+    # Saving the final raster
+    with memfile1.open() as final_src:
+        with rio.open(output, 'w', **final_src.profile) as final_dst:
+            final_dst.write(final_src.read())
+
+    del memfile1
+    del memfile2
     print('Raster saved to {0}'.format(output))
 
 def merge_rasters(rasters, output, method='first', resample_method='bilinear', compression=None, nodata=None):
@@ -608,6 +672,7 @@ def merge_rasters(rasters, output, method='first', resample_method='bilinear', c
     profile['height'] = merged_array.shape[1]
     profile['driver'] = 'GTiff'
     profile['nodata'] = nodata
+    profile['BIGTIFF'] = 'YES'
     
     # Apply compression if specified
     if compression:
@@ -618,14 +683,14 @@ def merge_rasters(rasters, output, method='first', resample_method='bilinear', c
         src.close()
     
     # Write the merged raster to the output file
-    with rio.open(output, 'w', **profile, BIGTIFF='YES') as dst:
+    with rio.open(output, 'w', **profile) as dst:
         dst.write(merged_array)
         
     print(f'Merged rasters at {output}')
 
 def difference_rasters(r1, r2, output, match_affine='first', method='nearest'):
     """
-    Calculate the difference between two raster files and save the result as a new raster.
+    Subtract r1 from r2 and save the result as a new raster.
 
     Parameters:
     r1: str
@@ -702,7 +767,7 @@ def difference_rasters(r1, r2, output, match_affine='first', method='nearest'):
             with rio.open(output, 'w', **target_profile) as dst:
                 dst.write(final, indexes=1)
                 
-def zonal_stats(df, raster, metric='mean', profile=None, band=1):
+def zonal_stats(df, raster, metric='mean', profile=None, band=1, quant=None):
     """
     Calculate zonal statistics for vector geometries on a raster.
 
@@ -743,11 +808,12 @@ def zonal_stats(df, raster, metric='mean', profile=None, band=1):
         'min': np.nanmin,
         'max': np.nanmax,
         'sum': np.nansum,
-        'nonzero': np.count_nonzero
+        'nonzero': np.count_nonzero,
+        'quantile':np.nanquantile
     }
     
     # Function to apply the metric function to the raster within the geometry
-    def run_func(func, geom, arr, trans):
+    def run_func(func, geom, arr, trans, quant):
         # Create a mask where the geometry overlaps the raster
         mask = rio.features.geometry_mask([geom], arr.shape, trans, invert=True)
         
@@ -756,11 +822,14 @@ def zonal_stats(df, raster, metric='mean', profile=None, band=1):
             return np.nan
         
         # Apply the metric function to the masked array
-        val = func(arr[mask])
+        if quant:
+            val = func(arr[mask],quant)
+        else:
+            val = func(arr[mask])
         return val
     
     # Apply the run_func to each geometry in the GeoDataFrame
-    stats = df.geometry.apply(lambda geom: run_func(met_dict[metric], geom, a, transform))
+    stats = df.geometry.apply(lambda geom: run_func(met_dict[metric], geom, a, transform, quant))
     stats = np.array(stats).astype(float)
 
     return stats
@@ -836,7 +905,7 @@ def sample_raster(raster, points, buff=None, metric='min', multiband=False, crs=
     
     return sampled_data
 
-def create_REM(dem, xs, output, Zcol=None, sample_dist=3, smooth_window=5, buffer=1000, limits=[-50, 50], method='min', vb=None, wse_path=None):
+def create_REM(dem, xs, output, Zcol=None, CSID=None, sample_dist=3, smooth_window=5, buffer=1000, limits=[-50, 50], method='min', vb=None, wse_path=None, save_xs=None):
     """
     Create a Relative Elevation Model (REM) from a DEM and cross-sections.
 
@@ -849,6 +918,9 @@ def create_REM(dem, xs, output, Zcol=None, sample_dist=3, smooth_window=5, buffe
         Path where the output REM raster file will be saved.
     Zcol: str, optional
         Column name for the elevation values in the cross-sections. If None, elevation will be sampled from the DEM.
+    CSID: str, optional
+        Column name for grouping cross-sections to smooth profile, use this to denote different streamlines/centerlines.
+        If None, all cross-sections are assumed to be on the same centerline.
     sample_dist: float, optional
         Distance between sample points along the cross-sections (in units of CRS).
     smooth_window: int, optional
@@ -872,6 +944,7 @@ def create_REM(dem, xs, output, Zcol=None, sample_dist=3, smooth_window=5, buffe
     # Load DEM and get CRS
     with rio.open(dem) as src:
         crs = src.crs
+        profile = src.profile.copy()
     
     # Load cross-sections and clip to the valley bottom polygon if provided
     if isinstance(xs, str):
@@ -887,17 +960,24 @@ def create_REM(dem, xs, output, Zcol=None, sample_dist=3, smooth_window=5, buffe
     if Zcol:
         xs['Z'] = xs[Zcol]
     else:
-        xsp = get_points(xs, sample_dist)
+        xsp = points(xs, sample_dist)
+        xsp = xsp[~np.isnan(xsp.geometry.x)]
+        xsp = xsp[~np.isnan(xsp.geometry.y)]
+        
         xsp['Z'] = sample_raster(dem, xsp)
+        xsp = xsp.dropna(subset='Z')
         
         if method == 'min':    
             xs['Z'] = xsp.groupby('CSID')['Z'].min()
         elif method == 'mean':
             xs['Z'] = xsp.groupby('CSID')['Z'].mean()
         
-        for i, group in xsp.groupby('CSID'):
-            xs.loc[xs.CSID == i, 'Z'] = xs.loc[xs.CSID == i, 'Z'].rolling(smooth_window, center=True, min_periods=1).mean()
-    
+        if not CSID:
+            xs['Z'] = xs['Z'].rolling(smooth_window, center=True, min_periods=1).mean()
+        else:
+            for i, group in xsp.groupby('CSID'):
+                xs.loc[xs[CSID] == i, 'Z'] = xs.loc[xs[CSID] == i, 'Z'].rolling(smooth_window, center=True, min_periods=1).mean()
+
     # Create points for interpolation along cross-sections
     def _get_int_points(row):
         intervals = np.linspace(0, row.geometry.length, num=4)
@@ -911,12 +991,14 @@ def create_REM(dem, xs, output, Zcol=None, sample_dist=3, smooth_window=5, buffe
     int_points = gpd.GeoDataFrame(pd.concat(int_points.values), crs=crs)
     int_points['Z'] = int_points.CSID.map(dict(zip(xs.index, xs.Z)))
     int_points = int_points.dropna()
+    int_points = int_points[~np.isnan(int_points.geometry.x)]
+    int_points = int_points[~np.isnan(int_points.geometry.y)]
     int_points.index = range(len(int_points))
-    int_points = int_points.iloc[int_points.round(1).drop_duplicates(subset=['CSID', 'Station']).index, :].reset_index(drop=True)
 
     # Clip the raster to the buffer of the cross-sections
     with rio.open(dem, 'r') as src:
         masked_array, masked_transform = mask(src, shapes=[box(*xs.total_bounds).buffer(buffer)], crop=True, nodata=-9999, indexes=1)
+        masked_array = np.where(np.isnan(masked_array),-9999,masked_array)
         nd_mask = (masked_array == -9999)
         
         # Update the masked raster profile
@@ -926,7 +1008,8 @@ def create_REM(dem, xs, output, Zcol=None, sample_dist=3, smooth_window=5, buffe
             "height": masked_array.shape[0],
             "width": masked_array.shape[1],
             "transform": masked_transform,
-            "nodata": -9999
+            "nodata": -9999,
+            'BIGTIFF': 'YES',
         })
            
     # Create linear RBF interpolator
@@ -960,6 +1043,10 @@ def create_REM(dem, xs, output, Zcol=None, sample_dist=3, smooth_window=5, buffe
     if wse_path:
         with rio.open(wse_path, 'w', **masked_profile) as wse_dst:
             wse_dst.write(wse, indexes=1)
+            
+    # Optionally save the XS shapefile
+    if save_xs:
+        xs.to_file(save_xs)
             
     print('\nREM created at {0}'.format(output))
 
@@ -1205,167 +1292,243 @@ def htab_2D(rem, extents, vcl, slope, roughness, channel_area=None, channel_roug
     else:
         return extents
     
-def pebble_count(photo_file, obj_color='yellow', obj_size_mm=190.5, min_area=50):
+def pebble_count(photos, obj_size_mm, method='rapid',model_path=None):
     """
     Count pebbles in an image and calculate their sizes.
 
     Parameters:
-    photo_file: str
-        Path to the image file (JPEG).
-    obj_color: str or tuple, optional
-        The color of the reference object in the image. Default is 'yellow'.
+    photos: list
+        List of image file paths (JPG or PNG).
     obj_size_mm: float, optional
-        The size of the reference object in millimeters. Default is 190.5 mm.
-    min_area: int, optional
-        Minimum area for detecting a region in the image. Default is 50.
+        The major axis length of the reference object in millimeters. Default is 190.5 mm.
+    method: str, optional
+        Sample all pebbles in photo ('detailed'), or sample roughly 100 grains ('rapid')
+    model_path: str, optional
+        File path to SegmentAnything model checkpoint,
+        if None then function uses a file path only available for w2r employees.
+        https://github.com/facebookresearch/segment-anything?tab=readme-ov-file#model-checkpoints
 
     Returns:
     None
         Saves the grain data and labeled image as files.
     """
+    def draw_polygon(image):
 
-    # Convert object color to RGBA format if it's a string
-    if isinstance(obj_color, str):
-        obj_color = colors.to_rgba(obj_color)
+        # Store the polygon points
+        polygon_points = []
+    
+        # Function to capture the polygon vertices
+        def onselect(verts):
+            nonlocal polygon_points
+            polygon_points = verts
+            print(f"Polygon coordinates: {polygon_points}")
+    
+        # Create the figure and axis for displaying the image
+        fig, ax = plt.subplots()
+        ax.imshow(image)
+    
+        # Allow the user to draw a polygon on the image
+        poly_selector = PolygonSelector(ax, onselect)
+    
+        # Display the plot and let the user interact with it
+        plt.show(block=True)
+            
+        path = Path(polygon_points)
+
+        # Create a grid of coordinates corresponding to the image pixels
+        height, width = image.shape[:2]
+        xx, yy = np.meshgrid(np.arange(width), np.arange(height))
+        coords = np.vstack((xx.flatten(), yy.flatten())).T
+    
+        # Check if each point is inside the polygon
+        inside = path.contains_points(coords)
+    
+        # Reshape the result to match the image shape (height, width)
+        mask_arr = inside.reshape((height, width)).astype('uint8')
+        
+        return mask_arr,polygon_points
+
+    
+    if method == 'rapid':
+        params = [12,256,0.9,0.7,10,0.3]
+    elif method == 'detailed':
+        params = [64,256,0.9,0.9,10,0.3]
+    else:
+        print("Please choose the 'rapid' or 'detailed' maethod")
+        return
     
     # Load SAM model for automatic mask generation
-    sam = sam_model_registry["vit_h"](checkpoint=r"Z:/Shared/W2r/Library/Python/sam_vit_h_4b8939.pth")
+    model = None
+    if not model_path:
+        sam = sam_model_registry["vit_h"](checkpoint=r"Z:/Shared/W2r/Library/Python/sam_vit_h_4b8939.pth")
+        model = 'vit_h'
+    else:
+        models = ['vit_b','vit_l','vit_h']
+        for m in models:
+            if m in model_path:
+                model = m
+                sam = sam_model_registry[m](checkpoint=model_path)
+                break
+    
+    if not model:
+        print('Model checkpoint needs to conatin version tag in file path: vit_b, vit_l, or vit_h.')
+        return
+
     mask_generator = SamAutomaticMaskGenerator(
         sam,
-        points_per_side=64, 
-        points_per_batch=32,
-        pred_iou_thresh=0.7,
-        stability_score_thresh=0.9,
-        min_mask_region_area=min_area
+        points_per_side=params[0],  # Reduced points
+        points_per_batch=params[1],  # Increased batch size for speed
+        pred_iou_thresh=params[2],  # Slightly lower threshold
+        stability_score_thresh=params[3],  # Relaxed stability
+        min_mask_region_area=params[4],  # Adjusted for smallest pebble size
+        crop_overlap_ratio=params[5],  # Minimal overlap
     )
     
-    # Load the image using Rasterio
-    with rio.open(photo_file) as src:
-        image = src.read()[:3, :, :]  # Read the first three bands (RGB)
-        image = np.transpose(image, axes=[1, 2, 0])  # Transpose to get (height, width, channels)
-        image = image.astype(np.uint8)
+    for photo_file in photos:
+    
+        # Load the image using Rasterio
+        with rio.open(photo_file) as src:
+            image = src.read()[:3, :, :]  # Read the first three bands (RGB)
+            image = np.transpose(image, axes=[1, 2, 0])  # Transpose to get (height, width, channels)
+            scaling_factors = (0.5, 0.5, 1.0)
+            image = zoom(image, zoom=scaling_factors, order=1)  # Scale down by 50%
+            image = image.astype(np.uint8)
         
-    # Generate masks for the image
-    masks = mask_generator.generate(image)
-    
-    def merge_masks(anns):
-        """
-        Merge masks from the mask generator into a single mask image.
+        ref_mask,ref_coords = draw_polygon(image)
+        rect = Polygon(ref_coords).minimum_rotated_rectangle
         
-        Parameters:
-        anns: list of dicts
-            List of annotations with segmentation masks.
-
-        Returns:
-        img: ndarray
-            Merged mask image.
-        """
-        sorted_anns = sorted(anns, key=lambda x: x['area'], reverse=True)
-        img = np.zeros((sorted_anns[0]['segmentation'].shape[0], sorted_anns[0]['segmentation'].shape[1]))
-        for i, ann in enumerate(sorted_anns):
-            m = ann['segmentation']
-            img[m] = i + 1
-        return img
-    
-    # Merge masks and convert to integer format
-    img = merge_masks(masks).astype(int)
-    
-    # Extract properties of the labeled regions
-    props = regionprops_table(
-        img, image,
-        properties=('label', 'area', 'bbox', 'major_axis_length', 'minor_axis_length', 'intensity_mean')
-    )
-    grain_data = pd.DataFrame(props)
-    grain_data[[col for col in grain_data.columns if 'intensity' in col]] /= 255
-    
-    # Calculate color closeness to the reference object color
-    grain_data['closeness'] = np.abs(grain_data[[col for col in grain_data.columns if 'intensity' in col]] - obj_color[:3]).sum(axis=1)
-    
-    # Identify the reference object by finding the closest color match
-    nb_label = grain_data.at[grain_data['closeness'].idxmin(), 'label']
-    bbox = grain_data.loc[[grain_data['closeness'].idxmin()], ['bbox-1', 'bbox-0', 'bbox-3', 'bbox-2']].apply(lambda x: [i for i in x], axis=1).values[0]
-    
-    # Calculate pixel size in millimeters based on the reference object
-    grain_data['pixel_size'] = obj_size_mm / grain_data.at[grain_data['closeness'].idxmin(), 'major_axis_length']
-    grain_data['mm'] = grain_data['minor_axis_length'] * grain_data['pixel_size']
+        # calculate the length of each side of the minimum bounding rectangle
+        ref_pixels = max([LineString((ref_coords[i], ref_coords[i+1])).length for i in range(len(ref_coords) - 1)])
+        
+        # Generate masks for the image
+        masks = mask_generator.generate(image)
+        
+        def merge_masks(anns):
+            """
+            Merge masks from the mask generator into a single mask image.
             
-    # Annotate the reference object in the data
-    grain_data['notes'] = np.nan
-    grain_data.loc[grain_data.label == nb_label, 'notes'] = 'Reference Obj'
+            Parameters:
+            anns: list of dicts
+                List of annotations with segmentation masks.
     
-    # Remove unnecessary columns
-    grain_data = grain_data.drop(columns=[col for col in grain_data.columns if 'intensity' in col] + ['closeness'])
-    
-    # Save grain data to a CSV file
-    grain_data.to_csv(photo_file.replace('.jpg', '_grain_data.csv'), index=False)
-    
-    # Plot the labeled image and grain size distribution
-    fig, ax = plt.subplots(2, 1, height_ratios=[2, 1], figsize=(10, 8))
-    ax[0].imshow(image)
-    nb_img = np.where(img == nb_label, 1, np.nan)
-    img = np.where(img == nb_label, 0, img)
-    ax[0].imshow(img, alpha=0.5, cmap='tab20')
-    ax[0].imshow(img == 0, alpha=0.5, cmap='bone_r')  
-    ax[0].imshow(nb_img, cmap='autumn')
-    gpd.GeoDataFrame([], geometry=[box(*bbox)]).plot(ax=ax[0], ec='r', fc='None', lw=1.2)
-    
-    ax[0].tick_params(
-        axis='both',
-        which='both',
-        bottom=True,
-        top=False,
-        labelbottom=False,
-        labelleft=False
-    )
-    
-    # Plot grain size distribution
-    bins = np.geomspace(0.1, 1000, 1000)
-    counts, bin_edges = np.histogram(grain_data.mm, bins=bins, range=None, density=None, weights=grain_data.area)
-    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-    ax[1].plot(centers, np.cumsum(counts) / sum(counts) * 100, color='k')
-    
-    ax[1].set_xscale('log')
-    ax[1].set_xlim(2, 1000)
+            Returns:
+            img: ndarray
+                Merged mask image.
+            """
+            sorted_anns = sorted(anns, key=lambda x: x['area'], reverse=True)
+            img = np.zeros((sorted_anns[0]['segmentation'].shape[0], sorted_anns[0]['segmentation'].shape[1]))
+            for i, ann in enumerate(sorted_anns):
+                m = ann['segmentation']
+                img[m] = i + 1
+            return img
         
-    # Add shaded regions for grain size categories
-    ax[1].axvspan(2, 4, color='k', alpha=0.25)
-    ax[1].axvspan(8, 16, color='k', alpha=0.25)
-    ax[1].axvspan(32, 64, color='k', alpha=0.25)
-    ax[1].axvspan(128, 256, color='k', alpha=0.25)
-    ax[1].axvspan(512, 1048, color='k', alpha=0.25)
-    
-    # Add labels for grain size categories
-    ax[1].text(2.83, 99, 'Very Fine\nGravel', va='top', ha='center')
-    ax[1].text(5.66, 99, 'Fine\nGravel', va='top', ha='center')
-    ax[1].text(11.3, 99, 'Medium\nGravel', va='top', ha='center')
-    ax[1].text(22.6, 99, 'Coarse\nGravel', va='top', ha='center')
-    ax[1].text(45.3, 99, 'Very Coarse\nGravel', va='top', ha='center')
-    ax[1].text(90.5, 99, 'Small\nCobbles', va='top', ha='center')
-    ax[1].text(181, 99, 'Large\nCobbles', va='top', ha='center')
-    ax[1].text(362, 99, 'Small\nBoulders', va='top', ha='center')
-    ax[1].text(724, 99, 'Large\nBoulders', va='top', ha='center')
-    
-    # Interpolate grain size distribution for D84, D50, and D16
-    gsd = interp1d(centers, np.cumsum(counts) / sum(counts) * 100)
-    
-    ax[1].text(0.99, 0.65, 'D84 = {0}'.format(gsd(84).round(1)), va='center', ha='right', transform=ax[1].transAxes)
-    ax[1].text(0.99, 0.5, 'D50 = {0}'.format(gsd(50).round(1)), va='center', ha='right', transform=ax[1].transAxes)
-    ax[1].text(0.99, 0.35, 'D16 = {0}'.format(gsd(16).round(1)), va='center', ha='right', transform=ax[1].transAxes)
+        # Merge masks and convert to integer format
+        img = merge_masks(masks).astype(int)
+        img[ref_mask.astype(bool)] = 0
+        
+        # Extract properties of the labeled regions
+        props = regionprops_table(
+            img, image,
+            properties=('label', 'area', 'perimeter', 'centroid', 'orientation', 'major_axis_length', 'minor_axis_length')
+        )
+        grain_data = pd.DataFrame(props)
+        grain_data = grain_data[grain_data.perimeter/grain_data.area<0.6]
+        
+        # Calculate pixel size in millimeters based on the reference object
+        grain_data['pixel_size'] = obj_size_mm / ref_pixels
+        grain_data['mm'] = grain_data['minor_axis_length'] * grain_data['pixel_size']
+                
+        # Save grain data to a CSV file
+        grain_data.to_csv(photo_file.split('.')[0]+'_grain_labels.csv', index=False)
+        
+        # Plot the labeled image and grain size distribution
+        fig, ax = plt.subplots(2, 1, height_ratios=[2, 1], figsize=(8, 8))
+        ax[0].imshow(image)
+        ax[0].imshow(img, alpha=0.5, cmap='tab20')
+        ax[0].imshow(img == 0, alpha=0.3, cmap='bone_r')  
+        
+        ref_mask = ref_mask.astype('float')
+        ref_mask[ref_mask==0] = np.nan
+        ax[0].imshow(ref_mask, cmap='autumn',alpha=0.5)
+        gpd.GeoSeries([rect]).plot(ax=ax[0],ec='r',fc='None',zorder=10)
+        
+        for _, row in grain_data.iterrows():
+            # Get properties for the fitted ellipse
+            y0, x0 = row['centroid-0'], row['centroid-1']
+            orientation = row['orientation'] + np.pi/2
 
-    ax[1].set_xlabel('Grain Size (mm)')
-    ax[1].set_ylabel('Percent Finer Than')
-    ax[1].axhline(16, ls='--', c='k', lw=0.5)
-    ax[1].axhline(50, ls='--', c='k', lw=0.5)
-    ax[1].axhline(84, ls='--', c='k', lw=0.5)
-    
-    fig.tight_layout()
-    
-    # Save the labeled image
-    fig.savefig(photo_file.replace('.jpg', '_grain_labels.png'), dpi=400)
-    
-    print('{0} pebbles counted for {1}'.format(len(grain_data), photo_file))
+            x1 = x0 + row['major_axis_length'] / 2 * np.cos(orientation)
+            y1 = y0 - row['major_axis_length'] / 2 * np.sin(orientation)
+            ax[0].plot([x0, x1], [y0, y1], 'k')
 
-def delineate_trees(ch_file, output, canopy_floor=15, min_ht=50, max_ht=100, min_area=20, combine_dist=5):
+            x2 = x0 - row['minor_axis_length'] / 2 * np.sin(orientation)
+            y2 = y0 - row['minor_axis_length'] / 2 * np.cos(orientation)
+            ax[0].plot([x0, x2], [y0, y2], 'k')
+            
+            ax[0].plot(x0, y0, '.k', markersize=5)
+        
+        ax[0].tick_params(
+            axis='both',
+            which='both',
+            bottom=True,
+            top=False,
+            labelbottom=False,
+            labelleft=False
+        )
+        
+        # Plot grain size distribution
+        bins = np.geomspace(0.1, 1000, 1000)
+        if method == 'rapid':
+            counts, bin_edges = np.histogram(grain_data.mm, bins=bins, range=None, density=None)
+        else:
+            counts, bin_edges = np.histogram(grain_data.mm, bins=bins, range=None, density=None, weights=grain_data.area)
+        centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        ax[1].plot(centers, np.cumsum(counts) / sum(counts) * 100, color='k')
+        
+        ax[1].set_xscale('log')
+        ax[1].set_xlim(2, 1000)
+            
+        # Add shaded regions for grain size categories
+        ax[1].axvspan(2, 4, color='k', alpha=0.25)
+        ax[1].axvspan(8, 16, color='k', alpha=0.25)
+        ax[1].axvspan(32, 64, color='k', alpha=0.25)
+        ax[1].axvspan(128, 256, color='k', alpha=0.25)
+        ax[1].axvspan(512, 1048, color='k', alpha=0.25)
+        
+        # Add labels for grain size categories
+        ax[1].text(2.83, 99, 'Very Fine\nGravel', va='top', ha='center')
+        ax[1].text(5.66, 99, 'Fine\nGravel', va='top', ha='center')
+        ax[1].text(11.3, 99, 'Medium\nGravel', va='top', ha='center')
+        ax[1].text(22.6, 99, 'Coarse\nGravel', va='top', ha='center')
+        ax[1].text(45.3, 99, 'Very Coarse\nGravel', va='top', ha='center')
+        ax[1].text(90.5, 99, 'Small\nCobbles', va='top', ha='center')
+        ax[1].text(181, 99, 'Large\nCobbles', va='top', ha='center')
+        ax[1].text(362, 99, 'Small\nBoulders', va='top', ha='center')
+        ax[1].text(724, 99, 'Large\nBoulders', va='top', ha='center')
+        
+        # Interpolate grain size distribution for D84, D50, and D16
+        gsd = interp1d(np.cumsum(counts) / sum(counts) * 100, centers)
+        
+        ax[1].text(0.99, 0.65, 'D84 = {0}'.format(gsd(84).round(1)), va='center', ha='right', transform=ax[1].transAxes)
+        ax[1].text(0.99, 0.5, 'D50 = {0}'.format(gsd(50).round(1)), va='center', ha='right', transform=ax[1].transAxes)
+        ax[1].text(0.99, 0.35, 'D16 = {0}'.format(gsd(16).round(1)), va='center', ha='right', transform=ax[1].transAxes)
+    
+        ax[1].set_xlabel('Grain Size (mm)')
+        ax[1].set_ylabel('Percent Finer Than')
+        ax[1].axhline(16, ls='--', c='k', lw=0.5)
+        ax[1].axhline(50, ls='--', c='k', lw=0.5)
+        ax[1].axhline(84, ls='--', c='k', lw=0.5)
+        
+        ax[1].text(0.98, 0.02, 'n = {0}'.format(len(grain_data)), va='bottom', ha='right', transform=ax[1].transAxes)
+        
+        fig.tight_layout()
+        
+        # Save the labeled image
+        fig.savefig(photo_file.split('.')[0]+'_grain_labels.png', dpi=400)
+        
+        print('{0} pebbles counted for {1}'.format(len(grain_data), photo_file))
+        
+def delineate_trees(ch_file, output, canopy_floor=15, min_ht=50, max_ht=100, min_area=20, combine_dist=5, veg_mask=None):
     """
     Identify trees from a canopy height model (CHM) raster file and export the results to a shapefile.
 
@@ -1399,6 +1562,9 @@ def delineate_trees(ch_file, output, canopy_floor=15, min_ht=50, max_ht=100, min
         a = gaussian_filter(a, sigma=1)
         # Filter out areas below the canopy floor threshold
         a = np.where(a > -canopy_floor, np.nan, a)
+        
+    if veg_mask is not None:            
+        a = np.where(veg_mask,a,np.nan)
 
     # Initialize the Grid and Raster objects
     chi_r = Raster(a)
@@ -1449,88 +1615,128 @@ def delineate_trees(ch_file, output, canopy_floor=15, min_ht=50, max_ht=100, min
     # Save the GeoDataFrame to a file
     gdf.to_file(output)
 
-def get_volume(terrain, df, target_elev='ELEVATION', method='cut', units='ft', save=None):
-    """
-    Calculate the volumes of cut or fill required for grading within polygons to a target elevation.
-
-    Parameters:
-    terrain : str
-        Path to the terrain raster file.
-    df : str or GeoDataFrame
-        Path to the shapefile or a GeoDataFrame containing the polygons.
-    target_elev : str or numeric
-        The target elevation or the column in df specifying target elevations for each polygon.
-    method : str
-        Method to calculate volumes ('cut' or 'fill').
-    units : str
-        Units of measurement for volume output ('ft' for cubic yards, 'm' for cubic meters).
-    save : str, optional
-        File path where the resulting GeoDataFrame with volume calculations is saved, otherwise return a dataframe.
-
-    Returns:
-    df : GeoDataFrame
-        GeoDataFrame with additional column 'Vol' for volumes, unless saved to file.
-    """
+def HSI(dep_raster,vel_raster,curve,output):
+    #time to define the preference curves for each salmon species and lifestage
+    #all lists are indexed the same 0=depth, 1=depth preference value, 2=velocity, 3=velocity preference value
+    ChnSpwnLR = [[0,0.55,1.05,1.55,5.05,10,30,35,99], #depth
+                    [0,0,0.75,1,1,0,0,0,0], #depth pref
+                    [0,0.55,0.75,1.55,3.55,4.95,6.55,7,99], #velocity
+                    [0,0,0.79,1,1,0,0,0,0]] #velocity pref
     
-    # Load the terrain raster
-    with rio.open(terrain) as src:
-        arr = src.read(1)
-        transform = src.transform
-        crs = src.crs
-
-    # Load the polygon data
-    if isinstance(df, str):
-        df = gpd.read_file(df)
-    df = df.to_crs(crs)
+    ChnSpwnSR = [[0,0.35,0.95,1.25,1.75,2.75,99],
+                    [0,0,0.8,0.94,1,0.4,0.4],
+                    [0,0.55,0.65,1.15,2.25,2.35,3.75,3.85,5,99],
+                    [0,0,0.1,0.2,1,1,0.5,0.2,0,0]]
     
-    # Assuming target_elev is a scalar numeric value...
-    if np.isscalar(target_elev) and isinstance(target_elev, (int, float)):
-        arr -= target_elev
+    ChnJuv = [[0,0.45,1.05,1.65,2.05,2.45,99],
+                 [0,0,0.3,0.85,0.95,1,1],
+                 [0,0.15,0.55,0.95,1.05,1.85,3.65,99],
+                 [0.24,0.3,0.85,1,1,0.45,0,0]]
+    
+    CohoSpwn = [[0,0.15,0.55,0.85,1.15,1.55,1.95,2.75,99],
+                   [0,0,0.65,1,1,0.9,0.53,0.35,0.35],
+                   [0,0.45,1.25,1.45,4.25,5,99],
+                   [0,0.53,1,1,0.62,0,0]]
+    
+    CohoJuv = [[0,0.1,0.25,1.55,2.5,3.25,3.9,4,99],
+               [0,0,0.25,0.9,1,1,0.9,0.27,0.27],
+               [0,0.15,0.3,0.45,0.6,1.2,2,99],
+               [0.78,1,0.96,0.31,0.2,0.16,0,0]]
+    
+    SockSpwn = [[0,0.15,0.55,1.15,1.25,1.55,99],
+                    [0,0,0.6,1,1,0.45,0.45],
+                    [0,0.05,0.25,0.85,1.25,2.35,3.95,99],
+                    [0,0,0.5,1,1,0.26,0,0]]
+    
+    RainbowTrout = [[0,0.55,1.55,2.25,2.6,2.75,3.4,4.75,99],
+               [0,0,0.45,0.5,0.65,1,1,0.66,0.66],
+               [0,0.85,1.75,2.65,3.7,5.25,99],
+               [0.25,1,0.45,0.4,0.1,0,0]]
+    
+    SpringChnHold = [[0,0.8,2,6.5,99],
+                    [0,0,0.1,1,1],
+                    [0,2.4,3.8,4.8,6,99],
+                    [1,1,0.8,0.2,0,0]]
+    
+    OmykissJuv = [[0,0.15,0.65,1.35,2.65,99],
+                  [0,0,0.1,0.63,1,1],
+                  [0,0.75,0.95,1.15,1.55,1.85,3.15,3.85,5,99],
+                  [0.55,1,1,0.87,0.78,0.54,0.3,0.07,0,0]]
+    
+    labels = ['Adult Chinook Spawning Large River',
+              'Adult Chinook Spawning Small River',
+              'Juvenile Chinook Rearing',
+              'Adult Coho Spawning',
+              'Juvenile Coho Rearing',
+              'Adult Sockeye Spawning',
+              'Juvenile/Adult Rainbow Trout Rearing',
+              'Spring Chinook Holding',
+              'O. mykiss Juvenile']
+    
+    curves = [ChnSpwnLR,ChnSpwnSR,ChnJuv,CohoSpwn,CohoJuv,SockSpwn,RainbowTrout,SpringChnHold,OmykissJuv]
+    curve_dict = dict(zip(labels,curves))
+    
+    dep_int = interp1d(curve_dict[curve][0],curve_dict[curve][1])
+    vel_int = interp1d(curve_dict[curve][2],curve_dict[curve][3])
+    
+    with rio.open(dep_raster) as src:
+        profile = src.profile.copy()
+
+        dep = src.read(1)
+        extent = np.where(dep==src.nodata,1,0)
+        dep[extent] = 0
+        dep = dep_int(dep)
         
-        if method == 'cut':
-            arr = np.where(arr < 0, 0, arr)
-        elif method == 'fill':
-            arr = np.where(arr > 0, 0, -arr)
-        else:
-            print("Method must be 'cut' or 'fill'.")
-            return
-
-        df['Vol'] = [np.sum(arr[rio.features.geometry_mask([geom], arr.shape, transform, invert=True)]) for geom in df.geometry]
-
-    # Assuming target_elev is a column name in df...
-    elif isinstance(target_elev, str): 
-        df['Vol'] = np.nan
-
-        for idx, row in df.iterrows():
-            target = row[target_elev]
-            arr_mod = arr - target
+    with rio.open(vel_raster) as src:
+        vel = src.read(1)
+        vel[extent] = 0
+        vel = vel_int(vel)
+    
+    comp = np.sqrt(dep*vel)
+    comp[extent] = -1
+    
+    profile['driver'] = 'GTIFF'
+    profile['nodata'] = -1
+    with rio.open(output,'w',**profile) as dst:
+        dst.write(comp, indexes=1)
+    
+def Dcrit(shear_raster,output,tc=0.06,psed=162.3128,pwater=62.428):
+    """
+    Compute the critical diameter (Dcrit) from a shear stress raster and save the result as a new raster.
+ 
+    Parameters:
+    ----------
+    shear_raster : str
+        Path to the input raster file containing shear stress values.
+    output : str
+        Path to the output raster file where the Dcrit values will be saved.
+    tc : float, optional
+        Critical shear stress threshold. Default is 0.06.
+    psed : float, optional
+        Sediment density in the same units as pwater (e.g., lb/ft³ or kg/m³). Default is 162.3128.
+    pwater : float, optional
+        Water density in the same units as psed. Default is 62.428.
+ 
+    Returns:
+    -------
+    None
+        Writes the processed raster to the specified output file.
+ 
+    Notes:
+    ------
+    - The function assumes the input raster has a valid nodata value.
+    """
+   
+    with rio.open(shear_raster) as src:
+        array = src.read()
+        profile = src.profile.copy()
+                
+        mask = np.where(array==src.nodata,1,0)
+        new_array = (array)/((psed - pwater)*tc)
+        new_array[mask] = src.nodata
             
-            if method == 'cut':
-                arr_mod = np.where(arr_mod < 0, 0, arr_mod)
-            elif method == 'fill':
-                arr_mod = np.where(arr_mod > 0, 0, -arr_mod)
-            else:
-                print("Method must be 'cut' or 'fill'.")
-                return
-
-            mask = rio.features.geometry_mask([row.geometry], arr.shape, transform, invert=True)
-            df.at[idx, 'Vol'] = np.sum(arr_mod[mask])
-    else:
-        print('Target elevation must be a scalar or column name.')
-        return
-
-    # Convert volumes to specified units
-    if units == 'ft':
-        df['Vol_KCY'] = df['Vol'] / transform[0] ** 3 / 1000
-    elif units == 'm':
-        df['Vol_KCY'] = df['Vol'] / transform[0] ** 3 * 1.308 / 1000
-    else:
-        print("Units must be 'ft' or 'm'.")
-        return
-
-    # Save or return the GeoDataFrame
-    if save:
-        df.to_file(save)
-        print(f'Volumes calculated and saved to {save}')
-    else:
-        return df
+        profile['driver'] = 'GTIFF'
+        with rio.open(output,'w',**profile) as dst:
+            dst.write(new_array)
+    
+    
